@@ -584,19 +584,16 @@ def _fused_decode_coverage_inputs(num_heads):
     )
 
 
-def test_ppu_fused_decode_bypasses_community_coverage():
-    with (
-        patch.object(kda_fused_decode, "is_sail", return_value=True),
-        patch.object(kda_fused_decode, "_SUPPORTED_HEADS", {12, 24, 48, 96}),
-    ):
-        for num_heads in (12, 24, 48, 96):
+def test_fused_decode_uses_platform_head_and_layout_contracts():
+    with patch.object(kda_fused_decode, "is_sail", return_value=True):
+        for num_heads in (4, 6, 8, 12, 16, 24, 48, 64, 96):
             assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(num_heads))
-        assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(6))
+        assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(3))
+        inputs = list(_fused_decode_coverage_inputs(4))
+        inputs[1] = torch.empty(2, 2 * 4 * 128, dtype=torch.bfloat16)[:, : 4 * 128]
+        assert not kda_fused_decode.covered(*inputs)
 
-    with (
-        patch.object(kda_fused_decode, "is_sail", return_value=False),
-        patch.object(kda_fused_decode, "_SUPPORTED_HEADS", {3, 6, 12}),
-    ):
+    with patch.object(kda_fused_decode, "is_sail", return_value=False):
         assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(6))
         assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(24))
 

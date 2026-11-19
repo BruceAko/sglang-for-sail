@@ -37,8 +37,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _SUPPORTED_HEADS = {3, 6, 12}
-if is_sail():
-    _SUPPORTED_HEADS = {12, 24, 48, 96}
+_SAIL_SUPPORTED_HEADS = {4, 6, 8, 12, 16, 24, 48, 64, 96}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -67,17 +66,19 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
-    if ssm_states.ndim < 4:
+    if ssm_states.ndim != 4:
         return False
     H, V, K = ssm_states.shape[-3:]
-    if H not in _SUPPORTED_HEADS:
+    sail = is_sail()
+    if H not in (_SAIL_SUPPORTED_HEADS if sail else _SUPPORTED_HEADS):
         return False
-    if is_sail():
-        return True
 
     seg = H * 128
     conv_dim = 3 * seg
+    dtype = mixed_qkv.dtype
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
+        return False
+    if dtype != torch.bfloat16 and not (sail and dtype == torch.float16):
         return False
     return (
         V == 128
@@ -90,11 +91,7 @@ def covered(
         and onorm_g.shape[-1] == seg
         and conv_states.ndim == 3
         and conv_states.shape[-2:] == (_CONV_STATE_W, conv_dim)
-        and mixed_qkv.dtype == torch.bfloat16
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-        and onorm_g.dtype == torch.bfloat16
-        and conv_states.dtype == torch.bfloat16
+        and a.dtype == b.dtype == onorm_g.dtype == conv_states.dtype == dtype
         and ssm_states.dtype == torch.float32
         and cache_indices.dtype == torch.int32
         and mixed_qkv.stride(-1) == 1
@@ -112,6 +109,7 @@ def covered(
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
         and cache_indices.is_contiguous()
+        and (not sail or (a.is_contiguous() and conv_states.stride(-2) == conv_dim))
     )
 
 
