@@ -33,6 +33,7 @@ class ForwardMetadata:
     logical_num_tokens: Optional[int] = None
     # Trusted PLA offsets for an unpadded extend batch with live state slots.
     pla_prefill_host_offsets: Optional[tuple[int, ...]] = None
+    prefill_has_initial_state: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
