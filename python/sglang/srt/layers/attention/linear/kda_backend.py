@@ -1242,6 +1242,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=True,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            pla_prefill_host_offsets=getattr(
+                self.forward_metadata, "pla_prefill_host_offsets", None
+            ),
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             layer_id=layer.layer_id,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state

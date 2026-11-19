@@ -181,6 +181,11 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
         ({"extend_seq_lens_cpu": [64]}, [0, 64], (0, 64)),
         ({"extend_seq_lens_cpu": [19]}, [0, 19], (0, 19)),
         ({"extend_seq_lens_cpu": [19, 45]}, [0, 19, 64], (0, 19, 64)),
+        (
+            {"pla_prefill_host_offsets": (0, 19, 64), "beta_is_raw": True},
+            [0, 19, 64],
+            (0, 19, 64),
+        ),
         ({"extend_seq_lens_cpu": (45, 19)}, [0, 45, 64], (0, 45, 64)),
         ({"extend_seq_lens_cpu": [0, 64]}, [0, 0, 64], (0, 0, 64)),
         ({"extend_seq_lens_cpu": [64, 0]}, [0, 64], None),
@@ -203,7 +208,13 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
     k = torch.zeros_like(q)
     v = torch.zeros_like(q)
     g = torch.zeros_like(q)
-    beta = torch.full((1, packed_tokens, num_heads), 0.5, dtype=torch.float32)
+    indexed = "pla_prefill_host_offsets" in extend_kwargs and not capturing
+    if extend_kwargs.get("beta_is_raw"):
+        beta = torch.full((1, packed_tokens, 2 * num_heads), 0.5, dtype=torch.bfloat16)[
+            ..., :num_heads
+        ]
+    else:
+        beta = torch.full((1, packed_tokens, num_heads), 0.5, dtype=torch.float32)
     num_sequences = len(device_offsets) - 1
     ssm_states = torch.zeros(
         (num_sequences + 1, num_heads, head_dim, head_dim), dtype=torch.float32
@@ -211,15 +222,16 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
     cache_indices = torch.arange(1, num_sequences + 1, dtype=torch.int32)
     device_cu = torch.tensor(device_offsets, dtype=torch.int32)
     # CPU backing storage, with device metadata/capture flags mocked explicitly.
-    query_start_loc = SimpleNamespace(
-        is_cuda=True, numel=device_cu.numel, to=device_cu.to
-    )
-    flashkda_fwd = Mock(
-        side_effect=lambda **kwargs: (
-            kwargs["out"].fill_(0.25),
-            kwargs["final_state"].copy_(kwargs["initial_state"] + 1),
-        )
-    )
+    query_start_loc = SimpleNamespace(is_cuda=True, numel=device_cu.numel)
+
+    def flashkda_mock(**kwargs):
+        kwargs["out"].fill_(0.25)
+        if "state_pool" in kwargs:
+            kwargs["state_pool"][kwargs["state_indices"]] += 1
+        else:
+            kwargs["final_state"].copy_(kwargs["initial_state"] + 1)
+
+    flashkda_fwd = Mock(side_effect=flashkda_mock)
     pla_module = ModuleType("pla")
     prefill_module = ModuleType("pla.prefill")
     flashkda_module = ModuleType("pla.prefill.flashkdapro")
@@ -269,9 +281,17 @@ def test_ppu_flashkda_dispatches_to_platform_operator(
     assert kwargs["beta"].dtype == torch.bfloat16
     assert kwargs["A_log"].shape == (num_heads,)
     assert kwargs["dt_bias"].shape == (num_heads, head_dim)
-    assert kwargs["cu_seqlens"].dtype == torch.int64
-    assert kwargs["cu_seqlens"].tolist() == device_offsets
+    assert kwargs["cu_seqlens"] is query_start_loc
+    if indexed:
+        assert kwargs["state_pool"] is ssm_states
+        assert kwargs["state_indices"] is cache_indices
+        assert "initial_state" not in kwargs
+    else:
+        assert "state_pool" not in kwargs
     assert kwargs["raw_cu_seqlens"] == (None if capturing else expected_raw)
+    if extend_kwargs.get("beta_is_raw"):
+        assert kwargs["beta"].data_ptr() == beta.data_ptr()
+        assert kwargs["beta"].stride() == (2 * num_heads, 1)
 
 
 @pytest.mark.parametrize(
@@ -320,7 +340,7 @@ def test_cuda_flashkda_does_not_receive_pla_host_offsets():
     states = torch.zeros((1, 4, 128, 128), dtype=torch.float32)
     external = SimpleNamespace(fwd=Mock())
     with (
-        patch.object(kda_flashkda, "is_ppu", return_value=False),
+        patch.object(kda_flashkda, "is_sail", return_value=False),
         patch.object(kda_flashkda, "_load_flash_kda", return_value=external),
         patch.object(kda_flashkda, "_pla_host_offsets") as host_offsets,
     ):

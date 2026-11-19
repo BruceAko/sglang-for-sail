@@ -226,6 +226,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            pla_prefill_host_offsets=kwargs.get("pla_prefill_host_offsets"),
         )
 
     def _fallback_reason(
@@ -308,6 +309,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
         extend_seq_lens_cpu: Optional[list] = None,
+        pla_prefill_host_offsets: Optional[tuple[int, ...]] = None,
     ) -> torch.Tensor:
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
@@ -327,7 +329,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # Kimi beta path.
         if not beta_is_raw:
             beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7))
-        beta = beta.to(torch.bfloat16).contiguous()
+        beta = beta.to(torch.bfloat16)
 
         # flash_kda wants A_log [H] fp32 and dt_bias [H, K] fp32. The model
         # stores A_log as [1, 1, H, 1] and dt_bias as 1D [H*K], so reshape both.
@@ -335,42 +337,63 @@ class FlashKDAKernel(LinearAttnKernelBase):
         if dt_bias is not None:
             dt_bias = dt_bias.reshape(num_heads, -1).float().contiguous()
 
-        # cu_seqlens must be int64 for flash_kda (FLA casts to long).
-        cu_seqlens = query_start_loc.to(torch.int64)
-
-        # flash_kda varlen state is [N, H, V, K] -- the SAME layout as sglang's
-        # KDA pool, so no transpose is needed. Advanced indexing copies, so the
-        # final state is written back in-place below (matching chunk_kda).
-        initial_state = ssm_states[cache_indices].contiguous()
-
         out_buf = torch.empty_like(v)
-        final_state = torch.empty_like(initial_state)
+        use_pla = is_sail()
+        use_indexed_state = False
+        if use_pla:
+            batch_size, seq_len, num_heads, head_dim = q.shape
+            num_tokens = batch_size * seq_len
+            beta = beta.reshape(num_tokens, num_heads)
+            if beta.stride(1) != 1 or beta.stride(0) < num_heads:
+                beta = beta.clone(memory_format=torch.contiguous_format)
+            raw_offsets = pla_prefill_host_offsets
+            if query_start_loc.is_cuda and torch.cuda.is_current_stream_capturing():
+                raw_offsets = None
+            if (
+                raw_offsets is not None
+                and len(raw_offsets) == query_start_loc.numel()
+                and raw_offsets[-1] == num_tokens
+            ):
+                use_indexed_state = (
+                    ssm_states.is_contiguous()
+                    and cache_indices.dtype == torch.int32
+                    and cache_indices.is_contiguous()
+                    and cache_indices.numel() + 1 == len(raw_offsets)
+                )
+            else:
+                raw_offsets = _pla_host_offsets(
+                    extend_seq_lens_cpu, query_start_loc, num_tokens
+                )
 
-        if is_sail():
+        if use_indexed_state:
+            state_kwargs = dict(state_pool=ssm_states, state_indices=cache_indices)
+        else:
+            # The external kernel and padded graph batches use compact state.
+            initial_state = ssm_states[cache_indices].contiguous()
+            final_state = torch.empty_like(initial_state)
+            state_kwargs = dict(initial_state=initial_state, final_state=final_state)
+
+        if use_pla:
             from pla.prefill.flashkdapro import flashkda_fwd
 
             logger.info_once(
                 "USE PPU SAIL CUDA PLA kernel: flashkda_fwd (KDA prefill/extend)"
             )
 
-            batch_size, seq_len, num_heads, head_dim = q.shape
             flashkda_fwd(
                 q=q.view(batch_size * seq_len, num_heads, head_dim),
                 k=k.view(batch_size * seq_len, num_heads, head_dim),
                 v=v.view(batch_size * seq_len, num_heads, head_dim),
                 g=g.view(batch_size * seq_len, num_heads, head_dim),
-                beta=beta.view(batch_size * seq_len, num_heads),
+                beta=beta,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 out=out_buf.view(batch_size * seq_len, num_heads, head_dim),
                 scale=scale,
                 lower_bound=lower_bound,
-                initial_state=initial_state,
-                final_state=final_state,
-                cu_seqlens=cu_seqlens,
-                raw_cu_seqlens=_pla_host_offsets(
-                    extend_seq_lens_cpu, query_start_loc, batch_size * seq_len
-                ),
+                cu_seqlens=query_start_loc,
+                raw_cu_seqlens=raw_offsets,
+                **state_kwargs,
             )
         else:
             flash_kda = _load_flash_kda()
@@ -379,18 +402,18 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 k,
                 v,
                 g,
-                beta,
+                beta.contiguous(),
                 scale,
                 out_buf,
                 A_log,
                 dt_bias,
                 lower_bound,
-                initial_state=initial_state,
-                final_state=final_state,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=query_start_loc.to(torch.int64),
+                **state_kwargs,
             )
 
-        ssm_states[cache_indices] = final_state
+        if not use_indexed_state:
+            ssm_states[cache_indices] = final_state
 
         # out_buf is already [1, packed_seq, HV, V].
         return out_buf

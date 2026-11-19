@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from itertools import accumulate
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -45,7 +46,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils import is_pin_memory_available, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
@@ -191,6 +192,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
         logical_num_tokens = None
+        pla_prefill_host_offsets = None
         track_mask_indices = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
@@ -321,12 +323,26 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                host_lengths = forward_batch.extend_seq_lens_cpu
                 if (
-                    forward_batch.extend_seq_lens_cpu is not None
-                    and len(forward_batch.extend_seq_lens_cpu) == bs
+                    host_lengths is not None
+                    and len(host_lengths) == bs
                     and forward_batch.tbo_parent_token_range is None
                 ):
-                    logical_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+                    if (
+                        is_sail()
+                        and bs > 0
+                        and forward_batch.forward_mode.is_extend()
+                        and all(length > 0 for length in host_lengths)
+                    ):
+                        # Padding rows have zero length and can share slot 0.
+                        # Real requests each own a distinct recurrent slot.
+                        pla_prefill_host_offsets = tuple(
+                            accumulate(host_lengths, initial=0)
+                        )
+                        logical_num_tokens = pla_prefill_host_offsets[-1]
+                    else:
+                        logical_num_tokens = sum(host_lengths)
                 else:
                     logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
@@ -351,6 +367,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             logical_num_tokens=logical_num_tokens,
+            pla_prefill_host_offsets=pla_prefill_host_offsets,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph
