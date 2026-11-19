@@ -81,6 +81,75 @@ def make_runner(
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
+    def test_sail_packed_prefill_forwards_state_pool_and_eager_offsets(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.mis_metadata = None
+        backend._use_strided_target_verify_qkv = False
+        backend._packed_pla_heads = {(16, 4)}
+        backend._packed_pla_auto_cp = True
+        backend._packed_pla_prefill = MagicMock(
+            return_value=(None, None, sentinel.packed_output, None, None)
+        )
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend=MagicMock(return_value=(sentinel.fallback, None, None))
+        )
+        states = torch.zeros(2, 16, 128, 128)
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba2_layer_cache=lambda _: SimpleNamespace(
+                conv=[torch.empty(2, 3072, 3)], temporal=states
+            )
+        )
+        indices = torch.tensor([1], dtype=torch.int32)
+        offsets = torch.tensor([0, 2], dtype=torch.int32)
+        backend.forward_metadata = ForwardMetadata(
+            query_start_loc=offsets,
+            mamba_cache_indices=indices,
+            pla_prefill_host_offsets=(0, 2),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens=torch.tensor([1]),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            head_q_dim=128,
+            head_k_dim=128,
+            head_v_dim=128,
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=16,
+            q_dim=512,
+            k_dim=512,
+            v_dim=2048,
+            A_log=torch.zeros(16),
+            dt_bias=torch.zeros(16, dtype=torch.bfloat16),
+        )
+        qkv = torch.zeros(2, 3072, dtype=torch.bfloat16)
+        gate = torch.zeros(2, 16, dtype=torch.bfloat16)
+        with (
+            patch.object(backend, "_convolve_prefill", return_value=qkv),
+            patch.object(backend, "_prefill_gates", return_value=(gate, gate)),
+            patch.object(torch.cuda, "is_current_stream_capturing") as capturing,
+        ):
+            capturing.return_value = False
+            self.assertIs(
+                backend.forward_extend(layer, batch, qkv, gate, gate),
+                sentinel.packed_output,
+            )
+            capturing.return_value = True
+            self.assertIs(
+                backend.forward_extend(layer, batch, qkv, gate, gate),
+                sentinel.fallback,
+            )
+
+        backend._packed_pla_prefill.assert_called_once()
+        args, kwargs = backend._packed_pla_prefill.call_args
+        self.assertIs(args[0], qkv)
+        self.assertIs(args[5], offsets)
+        self.assertIs(kwargs["initial_state"], states)
+        self.assertIs(kwargs["initial_state_indices"], indices)
+        self.assertEqual(kwargs["raw_cu_seqlens"], (0, 2))
+
     def test_prefill_conv_table_covers_only_nonempty_chunks(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"

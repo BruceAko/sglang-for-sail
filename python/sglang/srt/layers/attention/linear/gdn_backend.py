@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_sail, is_xpu
 from sglang.srt.utils.common import is_pin_memory_available, rank0_log
 
 _is_hip = is_hip()
@@ -538,6 +538,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+        self._packed_pla_prefill = None
+        if (
+            is_sail()
+            and backends.prefill.is_triton()
+            and envs.SGLANG_SAIL_PLA_CUDA.get()
+            and get_exec().mamba.linear_attn_prefill_backend is None
+        ):
+            try:
+                from pla.prefill.flashqla.ops import (
+                    SUPPORTED_HEAD_CONFIGS,
+                    gdn_prefill_packed_qkv_fwd,
+                )
+            except (ImportError, OSError):
+                pass
+            else:
+                self._packed_pla_prefill = gdn_prefill_packed_qkv_fwd
+                self._packed_pla_heads = SUPPORTED_HEAD_CONFIGS
+                # PLA 1.1.0 auto-selects overlap CP on tc01, which can cause
+                # long prefixes to be replayed in every continuation CTA.
+                self._packed_pla_auto_cp = torch.cuda.get_device_capability(
+                    model_runner.device
+                ) != (8, 0)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1037,6 +1059,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
+
+        packed_offsets = getattr(forward_metadata, "pla_prefill_host_offsets", None)
+        if (
+            packed_offsets is not None
+            and getattr(self, "_packed_pla_prefill", None) is not None
+            and not is_target_verify
+            and not needs_state_gather
+            and not forward_metadata.has_mamba_track_mask
+            and not forward_metadata.num_state_checkpoints
+            and kwargs.get("linear_attn_output") is None
+            and packed_offsets[-1] == seq_len
+            and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128
+            and layer.num_q_heads == layer.num_k_heads
+            and (layer.num_v_heads, layer.num_k_heads) in self._packed_pla_heads
+            and mixed_qkv.dtype in (torch.float16, torch.bfloat16)
+            and a.dtype == b.dtype == mixed_qkv.dtype
+            and ssm_states.dtype in (torch.float32, torch.bfloat16)
+            and ssm_states.is_contiguous()
+            and cache_indices.dtype == torch.int32
+            and cache_indices.is_contiguous()
+            and cache_indices.numel() + 1 == len(packed_offsets)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            packed_qkv = self._convolve_prefill(
+                layer, forward_batch, mixed_qkv, conv_states, cache_indices
+            )
+            _, _, out, _, _ = self._packed_pla_prefill(
+                packed_qkv,
+                a.reshape(seq_len, layer.num_v_heads).contiguous(),
+                b.reshape(seq_len, layer.num_v_heads).contiguous(),
+                layer.A_log.reshape(-1).float().contiguous(),
+                layer.dt_bias.reshape(-1).float().contiguous(),
+                query_start_loc,
+                num_qk_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                output_final_state=False,
+                auto_cp=self._packed_pla_auto_cp,
+                raw_cu_seqlens=packed_offsets,
+            )
+            return out
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num

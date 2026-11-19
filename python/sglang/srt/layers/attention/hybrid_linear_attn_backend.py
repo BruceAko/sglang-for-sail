@@ -336,7 +336,11 @@ class MambaAttnBackendBase(AttentionBackend):
                         is_sail()
                         and bs > 0
                         and forward_batch.forward_mode.is_extend()
-                        and all(length > 0 for length in host_lengths)
+                        and isinstance(host_lengths, (list, tuple))
+                        and all(
+                            type(length) is int and length > 0
+                            for length in host_lengths
+                        )
                     ):
                         # Padding rows have zero length and can share slot 0.
                         # Real requests each own a distinct recurrent slot.
