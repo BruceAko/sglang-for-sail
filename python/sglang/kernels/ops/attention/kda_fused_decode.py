@@ -37,7 +37,8 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _SUPPORTED_HEADS = {3, 6, 12}
-_SAIL_SUPPORTED_HEADS = {4, 6, 8, 12, 16, 24, 48, 64, 96}
+_SAIL_ORIGINAL_HEADS = {12, 24, 48, 96}
+_SAIL_ADDITIONAL_HEADS = {4, 6, 8, 16, 64}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -70,7 +71,10 @@ def covered(
         return False
     H, V, K = ssm_states.shape[-3:]
     sail = is_sail()
-    if H not in (_SAIL_SUPPORTED_HEADS if sail else _SUPPORTED_HEADS):
+    if sail and H in _SAIL_ORIGINAL_HEADS:
+        # The existing SAIL model handoff already prepares the PLA inputs.
+        return True
+    if H not in (_SAIL_ADDITIONAL_HEADS if sail else _SUPPORTED_HEADS):
         return False
 
     seg = H * 128

@@ -589,6 +589,10 @@ def test_fused_decode_uses_platform_head_and_layout_contracts():
         for num_heads in (4, 6, 8, 12, 16, 24, 48, 64, 96):
             assert kda_fused_decode.covered(*_fused_decode_coverage_inputs(num_heads))
         assert not kda_fused_decode.covered(*_fused_decode_coverage_inputs(3))
+        legacy = list(_fused_decode_coverage_inputs(12))
+        # The existing SAIL route does not inspect the activation layout again.
+        legacy[0] = sentinel.prepared_qkv
+        assert kda_fused_decode.covered(*legacy)
         inputs = list(_fused_decode_coverage_inputs(4))
         inputs[1] = torch.empty(2, 2 * 4 * 128, dtype=torch.bfloat16)[:, : 4 * 128]
         assert not kda_fused_decode.covered(*inputs)
